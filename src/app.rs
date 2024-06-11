@@ -38,7 +38,7 @@ use iced::{Alignment, Color};
 use once_cell::sync::Lazy;
 use pop_launcher::{ContextOption, GpuPreference, IconSource, SearchResult};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::str::FromStr;
 use std::time::Instant;
@@ -63,6 +63,9 @@ pub(crate) static MENU_ID: Lazy<SurfaceId> = Lazy::new(SurfaceId::unique);
 pub struct Args {
     #[clap(subcommand)]
     pub subcommand: Option<LauncherCommands>,
+    /// Alt tab displays windows in an unsorted, stable order
+    #[arg(long, action=clap::ArgAction::SetFalse)]
+    pub no_recent: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, clap::Subcommand)]
@@ -129,7 +132,7 @@ pub struct CosmicLauncher {
     core: Core,
     input_value: String,
     active_surface: bool,
-    launcher_items: Vec<SearchResult>,
+    launcher_items: VecDeque<SearchResult>,
     tx: Option<mpsc::Sender<launcher::Request>>,
     wait_for_result: bool,
     menu: Option<(u32, Vec<ContextOption>)>,
@@ -137,6 +140,7 @@ pub struct CosmicLauncher {
     focused: usize,
     last_hide: Instant,
     alt_tab: bool,
+    alt_tab_recent: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -235,14 +239,14 @@ impl cosmic::Application for CosmicLauncher {
     type Flags = Args;
     const APP_ID: &'static str = "com.system76.CosmicLauncher";
 
-    fn init(mut core: Core, _flags: Args) -> (Self, Command<Message>) {
+    fn init(mut core: Core, flags: Args) -> (Self, Command<Message>) {
         core.set_keyboard_nav(false);
         (
             CosmicLauncher {
                 core,
                 input_value: String::new(),
                 active_surface: false,
-                launcher_items: Vec::new(),
+                launcher_items: VecDeque::new(),
                 tx: None,
                 wait_for_result: false,
                 menu: None,
@@ -250,6 +254,7 @@ impl cosmic::Application for CosmicLauncher {
                 focused: 0,
                 last_hide: Instant::now(),
                 alt_tab: false,
+                alt_tab_recent: flags.no_recent,
             },
             text_input::focus(INPUT_ID.clone()),
         )
@@ -436,7 +441,58 @@ impl cosmic::Application for CosmicLauncher {
                             a.cmp(&b)
                         });
                         list.truncate(10);
-                        self.launcher_items.splice(.., list);
+                        // Reorder list such that:
+                        // * New windows
+                        // * Old windows in order by last recently used
+                        // * Everything else
+                        if self.alt_tab_recent {
+                            #[derive(Hash, PartialEq, Eq)]
+                            struct Window {
+                                gen: u32,
+                                id: u32,
+                            }
+                            let all_windows: HashSet<_> = list
+                                .iter()
+                                .filter_map(|item| item.window.map(|(gen, id)| Window { gen, id }))
+                                .collect();
+                            let old_windows: HashSet<_> = self
+                                .launcher_items
+                                .iter()
+                                .filter_map(|item| item.window.map(|(gen, id)| Window { gen, id }))
+                                .collect();
+                            let (new_windows, results): (Vec<_>, Vec<_>) =
+                                list.into_iter().partition(|item| {
+                                    item.window
+                                        .map(|(gen, id)| {
+                                            let window = Window { gen, id };
+                                            !old_windows.contains(&window)
+                                        })
+                                        .unwrap_or_default()
+                                });
+
+                            self.launcher_items = new_windows
+                                // Newly opened windows should be at the top of the list
+                                .into_iter()
+                                // Filter out closed windows but preserve opened order
+                                .chain(self.launcher_items.drain(..).filter(|item| {
+                                    item.window
+                                        .map(|(gen, id)| {
+                                            let window = Window { gen, id };
+                                            all_windows.contains(&window)
+                                        })
+                                        .unwrap_or_default()
+                                }))
+                                // Add everything else to the end of the list
+                                // All windows should be added prior to this point
+                                .chain(results.into_iter().filter(|item| item.window.is_none()))
+                                .collect();
+
+                            // Add new windows as well as whatever
+                            // .chain()
+                        } else {
+                            self.launcher_items.clear();
+                            self.launcher_items.extend(list);
+                        }
 
                         if self.wait_for_result {
                             self.wait_for_result = false;
@@ -523,6 +579,15 @@ impl cosmic::Application for CosmicLauncher {
             }
             Message::AltRelease => {
                 if self.alt_tab {
+                    if self.alt_tab_recent {
+                        // Push the selected window to the top of the queue to sort by
+                        // last recently used
+                        if let Some(top) = self.launcher_items.remove(self.focused) {
+                            self.launcher_items.push_front(top);
+                            self.focused = 0;
+                        }
+                    }
+
                     return self.update(Message::Activate(None));
                 }
             }
